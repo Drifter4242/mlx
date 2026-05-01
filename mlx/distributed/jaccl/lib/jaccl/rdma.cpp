@@ -2,10 +2,8 @@
 
 #include <dlfcn.h>
 #include <unistd.h>
-#include <cerrno>
 #include <iostream>
 #include <sstream>
-#include <system_error>
 
 #include "jaccl/rdma.h"
 
@@ -172,12 +170,7 @@ void Connection::create_queue_pair() {
   queue_pair = ibv().create_qp(protection_domain, &init_attr);
 
   if (queue_pair == nullptr) {
-    int err = errno;
-    std::string error_message = std::generic_category().message(err);
-    std::ostringstream msg;
-    msg << "[jaccl] Creating the queue pair failed with '" << error_message
-        << " (" << errno << ")'.";
-    throw std::runtime_error(msg.str());
+    throw std::runtime_error("[jaccl] Couldn't create queue pair");
   }
 }
 
@@ -189,26 +182,74 @@ const Destination& Connection::info() {
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
   ibv_gid gid = {};
-  bool found_gid = false;
-  for (int i = 0; i < port_attr.gid_tbl_len; i++) {
+
+  auto try_gid = [&](int i, bool require_ipv4_mapped) -> bool {
+    if (i < 0 || i >= port_attr.gid_tbl_len) {
+      return false;
+    }
     ibv_gid tmp;
-    if (ibv().query_gid(ctx, 1, i, &tmp) == 0) {
-      if (*(uint64_t*)&tmp.raw[0] == 0 && *(uint16_t*)&tmp.raw[8] == 0 &&
-          *(uint16_t*)&tmp.raw[10] == 0xffff) {
-        gid = tmp;
-        found_gid = true;
+    if (ibv().query_gid(ctx, 1, i, &tmp) != 0) {
+      return false;
+    }
+    if (require_ipv4_mapped) {
+      if (*(uint64_t*)&tmp.raw[0] != 0 || *(uint16_t*)&tmp.raw[8] != 0 ||
+          *(uint16_t*)&tmp.raw[10] != 0xffff) {
+        return false;
+      }
+    } else {
+      bool is_zero = true;
+      for (int j = 0; j < 16; j++) {
+        if (tmp.raw[j] != 0) {
+          is_zero = false;
+          break;
+        }
+      }
+      if (is_zero) {
+        return false;
+      }
+    }
+    gid = tmp;
+    return true;
+  };
+
+  // 1. Prefer IPv4-mapped IPv6 GID (RoCE v2 standard).
+  bool found = false;
+  for (int i = 0; i < port_attr.gid_tbl_len; i++) {
+    if (try_gid(i, /*require_ipv4_mapped=*/true)) {
+      found = true;
+      break;
+    }
+  }
+
+  // 2. Fallback for Apple Thunderbolt RDMA, which exposes only link-local
+  //    IPv6 (fe80::...) GIDs. Prefer index 1 (the actual rdma_enX port GID;
+  //    index 0 on Apple TB is typically derived from a non-RDMA interface
+  //    and routes elsewhere, surfacing as RTR errno 60 ETIMEDOUT).
+  if (!found) {
+    for (int i : {1, 0}) {
+      if (try_gid(i, /*require_ipv4_mapped=*/false)) {
+        found = true;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    for (int i = 2; i < port_attr.gid_tbl_len; i++) {
+      if (try_gid(i, /*require_ipv4_mapped=*/false)) {
+        found = true;
         break;
       }
     }
   }
 
-  // Fail here rather than hand an unset GID to the queue pair.
-  if (!found_gid) {
+  // Fail here rather than hand an unset GID to the queue pair (upstream
+  // #4191 diagnostic, adapted to the fallback chain above).
+  if (!found) {
     std::ostringstream msg;
-    msg << "[jaccl] No IPv4-mapped GID for this device. Thunderbolt RDMA ports "
-        << "only publish one once the interface has an IPv4 address; assign a "
-        << "link-local address to it, for example: ifconfig <interface> inet "
-        << "169.254.0.1 netmask 255.255.0.0 alias";
+    msg << "[jaccl] No usable GID for this device (neither IPv4-mapped nor "
+        << "non-zero IPv6). Thunderbolt RDMA ports publish an IPv4-mapped GID "
+        << "once the interface has an IPv4 address; assign one, for example: "
+        << "ifconfig <interface> inet 169.254.0.1 netmask 255.255.0.0 alias";
     throw std::runtime_error(msg.str());
   }
 
@@ -295,7 +336,6 @@ std::vector<Connection> create_connections(
     }
 
     // Search for the name and try to open the device
-    bool found = false;
     for (int i = 0; i < num_devices; i++) {
       if (name == ibv().get_device_name(devices[i])) {
         auto ctx = ibv().open_device(devices[i]);
@@ -305,18 +345,8 @@ std::vector<Connection> create_connections(
           throw std::runtime_error(msg.str());
         }
         connections.emplace_back(ctx);
-        found = true;
         break;
       }
-    }
-
-    // Returning a shorter vector than device_names would leave the callers,
-    // which size themselves from device_names, indexing past its end.
-    if (!found) {
-      std::ostringstream msg;
-      msg << "[jaccl] Could not find device " << name << " (" << num_devices
-          << " available)";
-      throw std::runtime_error(msg.str());
     }
   }
   ibv().free_device_list(devices);
@@ -324,7 +354,7 @@ std::vector<Connection> create_connections(
   return connections;
 }
 
-TCPAllGather::TCPAllGather(int rank, int size, const char* addr)
+SideChannel::SideChannel(int rank, int size, const char* addr)
     : rank_(rank), size_(size) {
   auto address = parse_address(addr);
 
@@ -359,29 +389,8 @@ TCPAllGather::TCPAllGather(int rank, int size, const char* addr)
   }
 }
 
-void TCPAllGather::operator()(const char* src, char* dst, size_t n_bytes) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (rank_ == 0) {
-    std::copy(src, src + n_bytes, dst);
-    for (int i = 1; i < size_; i++) {
-      sockets_[i - 1].recv(IBV_TAG, dst + i * n_bytes, n_bytes);
-    }
-    for (int i = 1; i < size_; i++) {
-      sockets_[i - 1].send(IBV_TAG, dst, size_ * n_bytes);
-    }
-  } else {
-    sockets_[0].send(IBV_TAG, src, n_bytes);
-    sockets_[0].recv(IBV_TAG, dst, size_ * n_bytes);
-  }
-}
-
-SideChannel::SideChannel(int rank, int size, AllGatherFn agf)
-    : rank_(rank), size_(size), all_gather_fn_(std::move(agf)) {}
-
 SideChannel::SideChannel(SideChannel&& sc)
-    : rank_(sc.rank_),
-      size_(sc.size_),
-      all_gather_fn_(std::move(sc.all_gather_fn_)) {
+    : rank_(sc.rank_), size_(sc.size_), sockets_(std::move(sc.sockets_)) {
   sc.rank_ = -1;
   sc.size_ = -1;
 }
