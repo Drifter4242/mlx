@@ -58,6 +58,13 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
     scheduler::enqueue(stream, [fence_ = fence_, value]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
       while (f.cpu_value()[0] < value) {
+#if defined(__aarch64__)
+        // mlx#3142: LDAR/DMB ISH is inner-shareable (CPU-only); a GPU or
+        // RDMA-DMA write to the fence page can stay invisible forever and
+        // this loop spins on a stale cache line. DSB SY (full system) makes
+        // the device write visible. Upstream wontfix; permanent fork carry.
+        __builtin_arm_dsb(0xf);
+#endif
       }
     });
     return;
@@ -97,6 +104,11 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
     scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
       f.cpu_value()[0] = count;
+#if defined(__aarch64__)
+      // mlx#3142 write side: seq_cst compiles to DMB ISH; the GPU-side
+      // fence_wait kernel may never observe the store. DSB SY publishes it.
+      __builtin_arm_dsb(0xf);
+#endif
     });
     return f.count;
   }
