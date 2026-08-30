@@ -211,6 +211,11 @@ inline bool metal_fast_synch() {
   return metal_fast_synch;
 }
 
+inline int max_active_tasks() {
+  static int max_active_tasks_ = get_var("MLX_MAX_ACTIVE_TASKS", 10);
+  return max_active_tasks_;
+}
+
 inline bool enable_tf32() {
   static bool enable_tf32_ = get_var("MLX_ENABLE_TF32", 1);
   return enable_tf32_;

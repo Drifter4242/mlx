@@ -22,8 +22,6 @@
 
 namespace mlx::core {
 
-static constexpr int MAX_ACTIVE_TASKS = 10;
-
 namespace {
 
 // Create a tracer copy of a primal for use in vjp/jvp. If the primal is a
@@ -268,7 +266,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
         cpu::eval(arr);
       }
 
-      if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+      if (scheduler::n_active_tasks() > env::max_active_tasks() ||
           (get_active_memory() > get_memory_limit() &&
            scheduler::n_active_tasks() > 0)) {
         // Commit any open streams
