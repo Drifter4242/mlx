@@ -99,18 +99,11 @@ Scheduler::Scheduler() {
 Scheduler::~Scheduler() = default;
 
 void Scheduler::enqueue(Stream s, std::function<void()> task) {
-  auto& st = get_thread(s);
-  st.enqueue([&st, task = std::move(task)]() mutable {
-    try {
-      task();
-    } catch (const std::exception& error) {
-      // Set error to stream only when no error happended before, to preserve
-      // the earliest error.
-      if (!st.error.valid()) {
-        st.error.set_message(std::make_shared<std::string>(error.what()));
-      }
-    }
-  });
+  // pre-#3742 semantics restored: exceptions in stream tasks propagate
+  // (std::terminate = loud crash) instead of silently poisoning the stream.
+  // Silent poisoning left partially-dispatched graphs with unsignaled
+  // events -> permanent Event::wait hangs under distributed TP (jaccl).
+  get_thread(s).enqueue(std::move(task));
 }
 
 void Scheduler::wait_event(
@@ -119,10 +112,8 @@ void Scheduler::wait_event(
     std::function<void(Event&)> task) {
   assert(s.device == Device::cpu);
   auto& st = get_thread(s);
-  st.enqueue([&st, event = std::move(event), task = std::move(task)]() mutable {
+  st.enqueue([event = std::move(event), task = std::move(task)]() mutable {
     task(event);
-    // Poison current stream if the waited event has error.
-    st.error.store_if_valid(event.load_error());
   });
 }
 
@@ -132,11 +123,7 @@ void Scheduler::signal_event(
     std::function<void(Event&)> task) {
   assert(s.device == Device::cpu);
   auto& st = get_thread(s);
-  st.enqueue([&st, event = std::move(event), task = std::move(task)]() mutable {
-    // Poison the signal event if current stream has error.
-    if (st.error.valid()) {
-      event.set_error(st.error);
-    }
+  st.enqueue([event = std::move(event), task = std::move(task)]() mutable {
     task(event);
   });
 }
