@@ -76,9 +76,10 @@ struct StreamThread {
   }
 
   void enqueue(std::function<void()> f) {
-    if (is_main_thread()) {
-      error.check();
-    }
+    // Do NOT check the stream error here: throwing mid-way through
+    // dispatching an eval graph leaves later signal_event entries
+    // un-enqueued -> permanently unsignaled events -> distributed
+    // Event::wait deadlock. Errors surface at wait/synchronize points.
     {
       std::lock_guard<std::mutex> lk(mtx);
       if (stop) {
