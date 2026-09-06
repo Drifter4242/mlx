@@ -4,6 +4,40 @@
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <pthread.h>
+
+// ---- fence trace ring buffer (exo fork, 2026-09-06 wedge hunt) ----------
+// Every Fence::update / Fence::wait records (fence buffer ptr, op, stream,
+// count, thread) here; a CPU-side spin longer than MLX_FENCE_SPIN_DUMP_S
+// (default 5) dumps the last entries to stderr once, so a wedge documents
+// the exact update/wait order without a debugger.
+namespace {
+struct FenceEv { uint64_t t_us; void* fence; uint32_t count; uint32_t stream; uint8_t op; uint8_t dev; uint64_t tid; };
+constexpr size_t kRing = 4096;
+FenceEv g_ring[kRing];
+std::atomic<uint64_t> g_seq{0};
+inline uint64_t now_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+inline uint64_t tid_now() { uint64_t t = 0; pthread_threadid_np(nullptr, &t); return t; }
+inline void trace_ev(void* fence, uint8_t op, mlx::core::Stream s, uint32_t count) {
+  auto i = g_seq.fetch_add(1, std::memory_order_relaxed) % kRing;
+  g_ring[i] = FenceEv{now_us(), fence, count, (uint32_t)s.index, op, (uint8_t)(s.device == mlx::core::Device::cpu ? 0 : 1), tid_now()};
+}
+void dump_trace(void* fence, uint32_t count, uint32_t value) {
+  static std::atomic<bool> dumped{false};
+  if (dumped.exchange(true)) return;
+  uint64_t n = g_seq.load(); size_t k = n < kRing ? n : kRing;
+  fprintf(stderr, "[mlx fence-trace] CPU spin on fence %p awaiting %u (value %u); active_tasks=%d; last %zu fence events (op 0=update 1=wait_cpu 2=wait_gpu; dev 0=cpu 1=gpu):\n",
+          fence, count, value, mlx::core::scheduler::n_active_tasks(), k);
+  for (uint64_t j = n - k; j < n; j++) { auto& e = g_ring[j % kRing];
+    fprintf(stderr, "[mlx fence-trace] %llu t=%llu fence=%p op=%u dev=%u stream=%u count=%u tid=%llu%s\n", (unsigned long long)j, (unsigned long long)e.t_us, e.fence, e.op, e.dev, e.stream, e.count, (unsigned long long)e.tid, e.fence == fence ? "  <== THIS" : ""); }
+  fflush(stderr);
+}
+} // namespace
+
 namespace mlx::core {
 
 struct FenceImpl {
@@ -55,9 +89,13 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
   }
 
   if (stream.device == Device::cpu) {
+    trace_ev(f.fence, 1, stream, value);
     scheduler::enqueue(stream, [fence_ = fence_, value]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
+      uint64_t spins = 0; uint64_t t0 = now_us();
+      static const uint64_t dump_after_us = (uint64_t)((getenv("MLX_FENCE_SPIN_DUMP_S") ? atof(getenv("MLX_FENCE_SPIN_DUMP_S")) : 5.0) * 1000000.0);
       while (f.cpu_value()[0] < value) {
+        if ((++spins & 0xFFFF) == 0 && now_us() - t0 > dump_after_us) { dump_trace(f.fence, value, f.cpu_value()[0]); t0 = UINT64_MAX / 2; }
 #if defined(__aarch64__)
         // mlx#3142: LDAR/DMB ISH is inner-shareable (CPU-only); a GPU or
         // RDMA-DMA write to the fence page can stay invisible forever and
@@ -70,6 +108,7 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
     return;
   }
 
+  trace_ev(f.fence, 2, stream, value);
   auto& d = metal::device(stream.device);
   auto& compute_encoder = metal::get_command_encoder(stream);
 
@@ -93,6 +132,7 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
 uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
   f.count++;
+  if (f.use_fast) trace_ev(f.fence, 0, stream, f.count);
 
   if (!f.use_fast) {
     f.event->set_value(f.count);
