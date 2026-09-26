@@ -16,15 +16,21 @@
 // (default 5) dumps the last entries to stderr once, so a wedge documents
 // the exact update/wait order without a debugger.
 namespace {
-struct FenceEv { uint64_t t_us; void* fence; uint32_t count; uint32_t stream; uint8_t op; uint8_t dev; uint64_t tid; };
+struct FenceEv { uint64_t t_us; void* fence; uint32_t count; uint32_t stream; uint8_t op; uint8_t dev; uint64_t tid; void* cb; };
 constexpr size_t kRing = 4096;
 FenceEv g_ring[kRing];
 std::atomic<uint64_t> g_seq{0};
 inline uint64_t now_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 inline uint64_t tid_now() { uint64_t t = 0; pthread_threadid_np(nullptr, &t); return t; }
-inline void trace_ev(void* fence, uint8_t op, mlx::core::Stream s, uint32_t count) {
+inline size_t trace_ev(void* fence, uint8_t op, mlx::core::Stream s, uint32_t count) {
   auto i = g_seq.fetch_add(1, std::memory_order_relaxed) % kRing;
-  g_ring[i] = FenceEv{now_us(), fence, count, (uint32_t)s.index, op, (uint8_t)(s.device == mlx::core::Device::cpu ? 0 : 1), tid_now()};
+  g_ring[i] = FenceEv{now_us(), fence, count, (uint32_t)s.index, op, (uint8_t)(s.device == mlx::core::Device::cpu ? 0 : 1), tid_now(), nullptr};
+  return i;
+}
+// op 3 = command buffer committed, op 4 = command buffer completed (fence = the MTL::CommandBuffer*)
+inline void trace_cb(uint8_t op, void* cb) {
+  auto i = g_seq.fetch_add(1, std::memory_order_relaxed) % kRing;
+  g_ring[i] = FenceEv{now_us(), cb, 0, 0, op, 1, tid_now(), cb};
 }
 inline bool self_release_enabled() {
   static const bool on = getenv("MLX_FENCE_SELF_RELEASE") && atoi(getenv("MLX_FENCE_SELF_RELEASE")) != 0;
@@ -35,10 +41,10 @@ void dump_trace(void* fence, uint32_t count, uint32_t value) {
   static std::atomic<int> dumps{0};
   if (dumps.fetch_add(1) >= (self_release_enabled() ? 8 : 1)) return;
   uint64_t n = g_seq.load(); size_t k = n < kRing ? n : kRing;
-  fprintf(stderr, "[mlx fence-trace] CPU spin on fence %p awaiting %u (value %u); active_tasks=%d; last %zu fence events (op 0=update 1=wait_cpu 2=wait_gpu; dev 0=cpu 1=gpu):\n",
+  fprintf(stderr, "[mlx fence-trace] CPU spin on fence %p awaiting %u (value %u); active_tasks=%d; last %zu fence events (op 0=update 1=wait_cpu 2=wait_gpu 3=cb_commit 4=cb_done; dev 0=cpu 1=gpu):\n",
           fence, count, value, mlx::core::scheduler::n_active_tasks(), k);
   for (uint64_t j = n - k; j < n; j++) { auto& e = g_ring[j % kRing];
-    fprintf(stderr, "[mlx fence-trace] %llu t=%llu fence=%p op=%u dev=%u stream=%u count=%u tid=%llu%s\n", (unsigned long long)j, (unsigned long long)e.t_us, e.fence, e.op, e.dev, e.stream, e.count, (unsigned long long)e.tid, e.fence == fence ? "  <== THIS" : ""); }
+    fprintf(stderr, "[mlx fence-trace] %llu t=%llu fence=%p op=%u dev=%u stream=%u count=%u tid=%llu cb=%p%s\n", (unsigned long long)j, (unsigned long long)e.t_us, e.fence, e.op, e.dev, e.stream, e.count, (unsigned long long)e.tid, e.cb, e.fence == fence ? "  <== THIS" : ""); }
   fflush(stderr);
 }
 
@@ -58,7 +64,7 @@ void self_release() {
   }
   for (uint64_t j = start; j < n; j++) {
     auto& e = g_ring[j % kRing];
-    if (e.op == 0) {
+    if (e.op != 1 && e.op != 2) {
       continue;
     }
     auto* v = static_cast<std::atomic_uint*>(static_cast<MTL::Buffer*>(e.fence)->contents());
@@ -80,6 +86,10 @@ void self_release() {
 } // namespace
 
 namespace mlx::core {
+
+void fence_trace_cbuf(uint8_t op, void* cb) {
+  trace_cb(op, cb);
+}
 
 struct FenceImpl {
   FenceImpl(Stream stream) {
@@ -157,9 +167,10 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
     return;
   }
 
-  trace_ev(f.fence, 2, stream, value);
+  auto slot = trace_ev(f.fence, 2, stream, value);
   auto& d = metal::device(stream.device);
   auto& compute_encoder = metal::get_command_encoder(stream);
+  g_ring[slot].cb = compute_encoder.get_command_buffer();
 
   // Register outputs to ensure that no kernels which depends on the
   // output starts before this one is done
@@ -181,7 +192,8 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
 uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
   f.count++;
-  if (f.use_fast) trace_ev(f.fence, 0, stream, f.count);
+  size_t slot = kRing;
+  if (f.use_fast) slot = trace_ev(f.fence, 0, stream, f.count);
 
   if (!f.use_fast) {
     f.event->set_value(f.count);
@@ -204,6 +216,7 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
 
   auto& d = metal::device(stream.device);
   auto& compute_encoder = metal::get_command_encoder(stream);
+  if (slot < kRing) g_ring[slot].cb = compute_encoder.get_command_buffer();
 
   // Launch input visibility kernels
   if (cross_device) {

@@ -28,6 +28,10 @@ struct hash<NS::SharedPtr<T>> {
 
 } // namespace std
 
+namespace mlx::core {
+void fence_trace_cbuf(uint8_t op, void* cb);
+}
+
 namespace mlx::core::metal {
 
 namespace {
@@ -555,6 +559,8 @@ void CommandEncoder::commit(std::function<void()> completion) {
           }
         }
       });
+  buffer_->addCompletedHandler([](MTL::CommandBuffer* cb) { fence_trace_cbuf(4, cb); });
+  fence_trace_cbuf(3, buffer_.get());
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
