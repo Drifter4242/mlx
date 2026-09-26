@@ -170,6 +170,11 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
   auto slot = trace_ev(f.fence, 2, stream, value);
   auto& d = metal::device(stream.device);
   auto& compute_encoder = metal::get_command_encoder(stream);
+  static const bool order_wait =
+      getenv("MLX_FENCE_ORDER_WAIT") ? atoi(getenv("MLX_FENCE_ORDER_WAIT")) != 0 : true;
+  if (order_wait) {
+    compute_encoder.wait_for_committed();
+  }
   g_ring[slot].cb = compute_encoder.get_command_buffer();
 
   // Register outputs to ensure that no kernels which depends on the

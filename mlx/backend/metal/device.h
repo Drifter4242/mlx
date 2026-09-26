@@ -95,6 +95,9 @@ class MLX_API CommandEncoder {
   bool needs_commit() const;
   void commit(std::function<void()> completion = nullptr);
   void synchronize();
+  // Encode a GPU-side wait until every previously committed command buffer on this queue has completed
+  // (task49: keeps spinning fence_wait kernels from starving earlier buffers).
+  void wait_for_committed();
 
   MTL::CommandBuffer* get_command_buffer() const {
     return buffer_.get();
@@ -111,6 +114,8 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  NS::SharedPtr<MTL::SharedEvent> order_event_;
+  uint64_t order_count_{0};
 
   // The residency set and how many of its sets this queue has attached.
   ResidencySets& residency_sets_;

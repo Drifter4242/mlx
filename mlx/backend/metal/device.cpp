@@ -559,12 +559,24 @@ void CommandEncoder::commit(std::function<void()> completion) {
           }
         }
       });
+  if (!order_event_) {
+    order_event_ = NS::TransferPtr(device_.mtl_device()->newSharedEvent());
+  }
+  buffer_->encodeSignalEvent(order_event_.get(), ++order_count_);
   buffer_->addCompletedHandler([](MTL::CommandBuffer* cb) { fence_trace_cbuf(4, cb); });
   fence_trace_cbuf(3, buffer_.get());
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;
+}
+
+void CommandEncoder::wait_for_committed() {
+  if (order_count_ == 0) {
+    return;
+  }
+  end_encoding();
+  buffer_->encodeWait(order_event_.get(), order_count_);
 }
 
 void CommandEncoder::synchronize() {
