@@ -26,14 +26,55 @@ inline void trace_ev(void* fence, uint8_t op, mlx::core::Stream s, uint32_t coun
   auto i = g_seq.fetch_add(1, std::memory_order_relaxed) % kRing;
   g_ring[i] = FenceEv{now_us(), fence, count, (uint32_t)s.index, op, (uint8_t)(s.device == mlx::core::Device::cpu ? 0 : 1), tid_now()};
 }
+inline bool self_release_enabled() {
+  static const bool on = getenv("MLX_FENCE_SELF_RELEASE") && atoi(getenv("MLX_FENCE_SELF_RELEASE")) != 0;
+  return on;
+}
 void dump_trace(void* fence, uint32_t count, uint32_t value) {
-  static std::atomic<bool> dumped{false};
-  if (dumped.exchange(true)) return;
+  // One full dump per process (several when self-release is on, so every release is documented).
+  static std::atomic<int> dumps{0};
+  if (dumps.fetch_add(1) >= (self_release_enabled() ? 8 : 1)) return;
   uint64_t n = g_seq.load(); size_t k = n < kRing ? n : kRing;
   fprintf(stderr, "[mlx fence-trace] CPU spin on fence %p awaiting %u (value %u); active_tasks=%d; last %zu fence events (op 0=update 1=wait_cpu 2=wait_gpu; dev 0=cpu 1=gpu):\n",
           fence, count, value, mlx::core::scheduler::n_active_tasks(), k);
   for (uint64_t j = n - k; j < n; j++) { auto& e = g_ring[j % kRing];
     fprintf(stderr, "[mlx fence-trace] %llu t=%llu fence=%p op=%u dev=%u stream=%u count=%u tid=%llu%s\n", (unsigned long long)j, (unsigned long long)e.t_us, e.fence, e.op, e.dev, e.stream, e.count, (unsigned long long)e.tid, e.fence == fence ? "  <== THIS" : ""); }
+  fflush(stderr);
+}
+
+// EXPERIMENTS ONLY (MLX_FENCE_SELF_RELEASE=1, task49): after a long CPU spin, find the ROOT of the wedge in the
+// trace ring -- the earliest wait (since the last >200 ms gap, i.e. the current eval) whose awaited value is
+// above the fence's current value -- and write that value, like scripts/fence_diagnose.py --apply does from
+// lldb. Lets a reproducer finish and exit cleanly instead of leaving an orphaned fence_wait kernel on the GPU
+// (which only a reboot clears). Output computed after a release may be wrong.
+void self_release() {
+  uint64_t n = g_seq.load();
+  size_t k = n < kRing ? n : kRing;
+  uint64_t start = n - k;
+  for (uint64_t j = n - k + 1; j < n; j++) {
+    if (g_ring[j % kRing].t_us - g_ring[(j - 1) % kRing].t_us > 200000) {
+      start = j;
+    }
+  }
+  for (uint64_t j = start; j < n; j++) {
+    auto& e = g_ring[j % kRing];
+    if (e.op == 0) {
+      continue;
+    }
+    auto* v = static_cast<std::atomic_uint*>(static_cast<MTL::Buffer*>(e.fence)->contents());
+    uint32_t cur = v[0].load();
+    if (cur < e.count) {
+      v[0].store(e.count);
+#if defined(__aarch64__)
+      __builtin_arm_dsb(0xf);
+#endif
+      fprintf(stderr, "[mlx fence-trace] SELF-RELEASE seq=%llu fence=%p op=%u dev=%u stream=%u value %u -> %u\n",
+              (unsigned long long)j, e.fence, e.op, e.dev, e.stream, cur, e.count);
+      fflush(stderr);
+      return;
+    }
+  }
+  fprintf(stderr, "[mlx fence-trace] SELF-RELEASE: no unsatisfied wait in the current eval (not the fence flavour)\n");
   fflush(stderr);
 }
 } // namespace
@@ -95,7 +136,15 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
       uint64_t spins = 0; uint64_t t0 = now_us();
       static const uint64_t dump_after_us = (uint64_t)((getenv("MLX_FENCE_SPIN_DUMP_S") ? atof(getenv("MLX_FENCE_SPIN_DUMP_S")) : 5.0) * 1000000.0);
       while (f.cpu_value()[0] < value) {
-        if ((++spins & 0xFFFF) == 0 && now_us() - t0 > dump_after_us) { dump_trace(f.fence, value, f.cpu_value()[0]); t0 = UINT64_MAX / 2; }
+        if ((++spins & 0xFFFF) == 0 && now_us() - t0 > dump_after_us) {
+          dump_trace(f.fence, value, f.cpu_value()[0]);
+          if (self_release_enabled()) {
+            self_release();
+            t0 = now_us();
+          } else {
+            t0 = UINT64_MAX / 2;
+          }
+        }
 #if defined(__aarch64__)
         // mlx#3142: LDAR/DMB ISH is inner-shareable (CPU-only); a GPU or
         // RDMA-DMA write to the fence page can stay invisible forever and
