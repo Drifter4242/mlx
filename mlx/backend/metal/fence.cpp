@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <pthread.h>
+#include <unordered_map>
+#include <utility>
 
 // ---- fence trace ring buffer (exo fork, 2026-09-06 wedge hunt) ----------
 // Every Fence::update / Fence::wait records (fence buffer ptr, op, stream,
@@ -92,7 +94,7 @@ void fence_trace_cbuf(uint8_t op, void* cb) {
 }
 
 struct FenceImpl {
-  FenceImpl(Stream stream) {
+  FenceImpl(Stream stream) : producer(stream) {
     auto d = metal::device(stream.device).mtl_device();
     if (!d->supportsFamily(MTL::GPUFamilyMetal3)) {
       use_fast = false;
@@ -106,18 +108,32 @@ struct FenceImpl {
       auto buf = allocator::malloc(sizeof(uint32_t)).ptr();
       fence = static_cast<void*>(buf);
       cpu_value()[0] = 0;
+      // GPU->GPU handoffs are ordered with this shared event instead of a spin kernel (aidiffuser 838f11c816).
+      auto p = metal::new_scoped_memory_pool();
+      gpu_event = d->newSharedEvent();
     }
   }
 
   ~FenceImpl() {
     if (use_fast) {
+      if (gpu_event) {
+        auto p = metal::new_scoped_memory_pool();
+        gpu_event->release();
+      }
       allocator::free(allocator::Buffer{static_cast<MTL::Buffer*>(fence)});
     }
   }
   bool use_fast{false};
+  Stream producer; // the stream whose arrays this fence publishes
+  // Spin-path (fence word) and event-path updates are counted separately.
   uint32_t count{0};
+  uint32_t event_count{0};
   void* fence;
+  MTL::SharedEvent* gpu_event{nullptr};
   std::unique_ptr<Event> event;
+  // Fast path: for each array handed across streams, whether it was published through gpu_event and the value a
+  // consumer waits for. Only touched on the scheduling thread.
+  std::unordered_map<uintptr_t, std::pair<bool, uint32_t>> targets;
 
   std::atomic_uint* cpu_value() {
     return static_cast<std::atomic_uint*>(
@@ -136,6 +152,23 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
     auto& event = *f.event;
     event.set_value(value);
     event.wait(stream);
+    return;
+  }
+
+  bool via_event = false;
+  if (auto it = f.targets.find(x.id()); it != f.targets.end()) {
+    via_event = it->second.first;
+    value = it->second.second;
+  }
+
+  if (stream.device == Device::cpu && via_event) {
+    // Published through the event (every consumer looked like a GPU queue at update time): wait on the event.
+    scheduler::enqueue(stream, [fence_ = fence_, value]() mutable {
+      auto& f = *static_cast<FenceImpl*>(fence_.get());
+      if (!f.gpu_event->waitUntilSignaledValue(value, -1)) {
+        throw std::runtime_error("[Fence::wait] Timed out");
+      }
+    });
     return;
   }
 
@@ -167,9 +200,36 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
     return;
   }
 
+  auto& compute_encoder_ev = metal::get_command_encoder(stream);
+  if (via_event) {
+    // Another GPU queue produced x: hardware event wait, no spin kernel, nothing to register.
+    compute_encoder_ev.end_encoding();
+    auto* command_buffer = compute_encoder_ev.get_command_buffer();
+    command_buffer->encodeWait(f.gpu_event, value);
+    command_buffer->addCompletedHandler([fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+    return;
+  }
+  if (f.producer.device == Device::gpu) {
+    // x went through the fence word (a CPU stream also consumes it) but this consumer is another GPU queue:
+    // signal the event behind the producer queue's encoded work and wait on that instead of spinning.
+    auto& producer_encoder = metal::get_command_encoder(f.producer);
+    producer_encoder.end_encoding();
+    auto* producer_buffer = producer_encoder.get_command_buffer();
+    f.event_count++;
+    producer_buffer->encodeSignalEvent(f.gpu_event, f.event_count);
+    producer_buffer->addCompletedHandler([fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+    f.targets[x.id()] = {true, f.event_count};
+    compute_encoder_ev.end_encoding();
+    auto* command_buffer = compute_encoder_ev.get_command_buffer();
+    command_buffer->encodeWait(f.gpu_event, f.event_count);
+    command_buffer->addCompletedHandler([fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+    return;
+  }
+
+  // CPU -> GPU handoff: spin kernel (+ task49 order-wait so it cannot starve earlier buffers).
   auto slot = trace_ev(f.fence, 2, stream, value);
   auto& d = metal::device(stream.device);
-  auto& compute_encoder = metal::get_command_encoder(stream);
+  auto& compute_encoder = compute_encoder_ev;
   static const bool order_wait =
       getenv("MLX_FENCE_ORDER_WAIT") ? atoi(getenv("MLX_FENCE_ORDER_WAIT")) != 0 : true;
   if (order_wait) {
@@ -196,15 +256,29 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
 
 uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
-  f.count++;
-  size_t slot = kRing;
-  if (f.use_fast) slot = trace_ev(f.fence, 0, stream, f.count);
 
   if (!f.use_fast) {
+    f.count++;
     f.event->set_value(f.count);
     f.event->signal(stream);
     return f.count;
   }
+
+  if (stream.device == Device::gpu && !cross_device) {
+    // Every consumer of x is another GPU queue: signal the shared event behind this queue's encoded work.
+    auto& enc = metal::get_command_encoder(stream);
+    f.event_count++;
+    f.targets[x.id()] = {true, f.event_count};
+    enc.end_encoding();
+    auto* command_buffer = enc.get_command_buffer();
+    command_buffer->encodeSignalEvent(f.gpu_event, f.event_count);
+    command_buffer->addCompletedHandler([fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+    return f.event_count;
+  }
+
+  f.count++;
+  f.targets[x.id()] = {false, f.count};
+  size_t slot = trace_ev(f.fence, 0, stream, f.count);
 
   if (stream.device == Device::cpu) {
     scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
@@ -223,8 +297,8 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   auto& compute_encoder = metal::get_command_encoder(stream);
   if (slot < kRing) g_ring[slot].cb = compute_encoder.get_command_buffer();
 
-  // Launch input visibility kernels
-  if (cross_device) {
+  // A CPU consumer is involved: make x visible across the device boundary, then publish via the fence word.
+  {
     auto kernel = d.get_kernel("input_coherent");
     uint32_t nthreads = (x.data_size() * x.itemsize() + sizeof(uint32_t) - 1) /
         sizeof(uint32_t);
